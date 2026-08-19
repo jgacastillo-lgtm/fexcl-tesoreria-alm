@@ -16,15 +16,12 @@ st.markdown("Centro de Control de Liquidez: Proyección de Activos vs Fondeadore
 # ==========================================
 st.sidebar.header("⚙️ Supuestos del Modelo")
 
-st.sidebar.subheader("Riesgo de Cartera")
 tasa_morosidad = st.sidebar.slider(
     "Tasa de Morosidad (Impago en Activo)", 
     min_value=0.0, max_value=30.0, value=5.0, step=0.5, format="%f%%"
 ) / 100.0
 
 st.sidebar.subheader("Salidas No Renovadas (Pasivo)")
-st.sidebar.markdown("Capital que sabemos que NO se renovará (Afecta Liquidez):")
-# Proyectamos 6 meses a partir de hoy (Agosto 2026)
 meses_proyectados = [(datetime.date.today() + pd.DateOffset(months=i)).strftime('%Y-%m') for i in range(6)]
 salidas_reales = {}
 for mes in meses_proyectados:
@@ -33,11 +30,9 @@ for mes in meses_proyectados:
 # ==========================================
 # 3. CONEXIÓN A GOOGLE SHEETS Y LIMPIEZA
 # ==========================================
-# IMPORTANTE: Mantén aquí tu URL real de "Tesoreria FEXCL"
-URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing"
+URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing" # Pega tu URL aquí
 
 def limpiar_numeros(df, columnas):
-    """Limpia formatos de moneda y texto para convertirlos a números matemáticos puros."""
     for col in columnas:
         if col in df.columns:
             df[col] = pd.to_numeric(
@@ -53,8 +48,7 @@ def cargar_datos_sheets():
     df_pas = conn.read(spreadsheet=URL_SHEET, worksheet="Pasivo")
     
     df_act = limpiar_numeros(df_act, ['Capital', 'Interés', 'Total'])
-    df_pas = limpiar_numeros(df_pas, ['Monto de Inversión', 'Monto Cupón', '% Rendimiento'])
-    
+    df_pas = limpiar_numeros(df_pas, ['Monto de Inversión', '% Rendimiento'])
     return df_act, df_pas
 
 try:
@@ -64,9 +58,10 @@ except Exception as e:
     st.stop()
 
 # ==========================================
-# 4. MOTORES DE PROYECCIÓN (ALM)
+# 4. MOTORES DE PROYECCIÓN (ALM) EXACTOS
 # ==========================================
-# --- Motor del Pasivo ---
+DIAS_BASE = 360 # Base comercial estándar para cálculo de tasas anualizadas
+
 def proyectar_flujos_pasivo(df):
     flujos = []
     df['Fecha de inicio'] = pd.to_datetime(df['Fecha de inicio'], errors='coerce')
@@ -79,24 +74,44 @@ def proyectar_flujos_pasivo(df):
         inicio = row['Fecha de inicio']
         fin = row['Fecha de vencimiento']
         
+        # Validar y formatear la tasa
         tasa = row.get('% Rendimiento', 0)
         if isinstance(tasa, (int, float)) and tasa > 1:
             tasa = tasa / 100.0
             
+        # 1. Capital Total al Final (para Mensual o Al término)
         if pd.notna(fin) and tipo_pago != 'Amortización':
             flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Capital', 'Monto': monto_inv})
         
+        # 2. ESQUEMA MENSUAL (Interés por días exactos transcurridos)
         if tipo_pago == 'Mensual' and pd.notna(inicio) and pd.notna(fin):
-            cupon = row.get('Monto Cupón', 0)
-            fechas_pago = pd.date_range(start=inicio, end=fin, freq='MS') 
-            for fecha in fechas_pago:
-                if fecha > inicio and fecha <= fin:
-                    flujos.append({'Fecha': fecha, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': cupon})
-                    
-        elif tipo_pago == 'Al termino' and pd.notna(fin):
-            interes_total = monto_inv * tasa 
-            flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': interes_total})
+            fechas_pago = pd.date_range(start=inicio, end=fin, freq='MS')
             
+            # Ajustamos al día de pago si existe
+            try:
+                dia = int(str(row.get('Día pago cupón', '1')).replace('.0', '').strip())
+                fechas_pago = fechas_pago.map(lambda x: x.replace(day=min(dia, x.days_in_month)))
+            except:
+                pass
+                
+            fecha_anterior = inicio
+            for fecha_actual in fechas_pago:
+                if fecha_actual > inicio and fecha_actual <= fin:
+                    # Cálculo matemático exacto
+                    dias_transcurridos = (fecha_actual - fecha_anterior).days
+                    interes_calculado = monto_inv * (tasa / DIAS_BASE) * dias_transcurridos
+                    
+                    flujos.append({'Fecha': fecha_actual, 'Fondeador': fondeador, 'Concepto': 'Interés (Calculado)', 'Monto': interes_calculado})
+                    fecha_anterior = fecha_actual # Se actualiza para el siguiente ciclo
+                    
+        # 3. ESQUEMA AL TÉRMINO (Interés por días totales transcurridos)
+        elif tipo_pago == 'Al termino' and pd.notna(inicio) and pd.notna(fin):
+            dias_totales = (fin - inicio).days
+            interes_total = monto_inv * (tasa / DIAS_BASE) * dias_totales
+            
+            flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Interés (Calculado)', 'Monto': interes_total})
+            
+        # 4. ESQUEMA AMORTIZACIÓN
         elif tipo_pago == 'Amortización' and pd.notna(inicio) and pd.notna(fin):
             fechas_pago = pd.date_range(start=inicio, end=fin, freq='MS')
             try:
@@ -111,17 +126,18 @@ def proyectar_flujos_pasivo(df):
             if num_pagos > 0:
                 capital_mensual = monto_inv / num_pagos
                 saldo_insoluto = monto_inv
-                cupon = row.get('Monto Cupón', 0)
+                fecha_anterior = inicio
                 
-                for fecha in fechas_validas:
-                    flujos.append({'Fecha': fecha, 'Fondeador': fondeador, 'Concepto': 'Amortización Capital', 'Monto': capital_mensual})
-                    if cupon > 0:
-                        flujos.append({'Fecha': fecha, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': cupon})
-                    elif tasa > 0:
-                        interes_mes = saldo_insoluto * (tasa / 12)
-                        flujos.append({'Fecha': fecha, 'Fondeador': fondeador, 'Concepto': 'Interés (S.I.)', 'Monto': interes_mes})
+                for fecha_actual in fechas_validas:
+                    flujos.append({'Fecha': fecha_actual, 'Fondeador': fondeador, 'Concepto': 'Amortización Capital', 'Monto': capital_mensual})
+                    
+                    if tasa > 0:
+                        dias_transcurridos = (fecha_actual - fecha_anterior).days
+                        interes_mes = saldo_insoluto * (tasa / DIAS_BASE) * dias_transcurridos
+                        flujos.append({'Fecha': fecha_actual, 'Fondeador': fondeador, 'Concepto': 'Interés (Calculado S.I.)', 'Monto': interes_mes})
                     
                     saldo_insoluto -= capital_mensual
+                    fecha_anterior = fecha_actual
 
     df_flujos = pd.DataFrame(flujos)
     if not df_flujos.empty:
@@ -151,7 +167,6 @@ else:
 
 df_alm = pd.merge(df_flujos_activo, salidas_mensuales, on='Mes-Año', how='outer').fillna(0)
 
-# Sumamos los retiros manuales
 for mes, retiro in salidas_reales.items():
     if mes in df_alm['Mes-Año'].values:
         df_alm.loc[df_alm['Mes-Año'] == mes, 'Salidas (Pasivo)'] += retiro
@@ -166,55 +181,44 @@ df_alm['Liquidez Acumulada'] = df_alm['Flujo Neto'].cumsum()
 # ==========================================
 # 5. DASHBOARD Y VISUALIZACIÓN
 # ==========================================
-tab1, tab2, tab3 = st.tabs(["📊 Centro de Mando (Dashboard)", "📥 Detalle Activo", "📤 Detalle Pasivo"])
+tab1, tab2, tab3 = st.tabs(["📊 Centro de Mando", "📥 Detalle Activo", "📤 Detalle Pasivo"])
 
 with tab1:
     st.header("Indicadores Clave (KPIs)")
-    
     total_activo = df_activo['Capital'].sum() if 'Capital' in df_activo.columns else 0
     total_pasivo = df_pasivo['Monto de Inversión'].sum() if 'Monto de Inversión' in df_pasivo.columns else 0
     flujo_proximo_mes = df_alm['Flujo Neto'].iloc[0] if not df_alm.empty else 0
     
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Cartera Viva (Activo)", f"${total_activo:,.2f}")
-    col2.metric("Fondeo Total (Pasivo)", f"${total_pasivo:,.2f}")
+    col1.metric("Cartera Viva", f"${total_activo:,.2f}")
+    col2.metric("Fondeo Total", f"${total_pasivo:,.2f}")
     col3.metric("Tasa Morosidad", f"{tasa_morosidad*100:.1f}%")
     col4.metric("Flujo Neto (Próx. Mes)", f"${flujo_proximo_mes:,.2f}")
 
     st.divider()
-    st.subheader("Gráfica de Liquidez Mensual (Calce de Plazos)")
+    st.subheader("Gráfica de Liquidez Mensual")
     
     if not df_alm.empty:
-        # --- NUEVO: Control de Rango de Fechas ---
         meses_disponibles = sorted(df_alm['Mes-Año'].unique())
-        
         if len(meses_disponibles) > 1:
-            mes_inicio, mes_fin = st.select_slider(
-                "Selecciona el horizonte de tiempo que deseas analizar:",
-                options=meses_disponibles,
-                value=(meses_disponibles[0], meses_disponibles[-1])
-            )
-            # Filtramos el dataframe base según la selección del usuario
+            mes_inicio, mes_fin = st.select_slider("Selecciona el horizonte de tiempo:", options=meses_disponibles, value=(meses_disponibles[0], meses_disponibles[-1]))
             df_grafica = df_alm[(df_alm['Mes-Año'] >= mes_inicio) & (df_alm['Mes-Año'] <= mes_fin)]
         else:
             df_grafica = df_alm
             
-        # Graficamos con los datos filtrados
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=df_grafica['Mes-Año'], y=df_grafica['Entradas (Activo)'], name='Entradas Esperadas (Cobranza)', marker_color='#2ca02c'))
-        fig.add_trace(go.Bar(x=df_grafica['Mes-Año'], y=-df_grafica['Salidas (Pasivo)'], name='Salidas Proyectadas (Fondeadores)', marker_color='#d62728'))
+        fig.add_trace(go.Bar(x=df_grafica['Mes-Año'], y=df_grafica['Entradas (Activo)'], name='Entradas (Cobranza)', marker_color='#2ca02c'))
+        fig.add_trace(go.Bar(x=df_grafica['Mes-Año'], y=-df_grafica['Salidas (Pasivo)'], name='Salidas (Fondeadores)', marker_color='#d62728'))
         fig.add_trace(go.Scatter(x=df_grafica['Mes-Año'], y=df_grafica['Flujo Neto'], name='Flujo Neto del Mes', mode='lines+markers', line=dict(color='black', width=3)))
         
-        fig.update_layout(barmode='relative', title=f"Entradas vs Salidas Proyectadas ({mes_inicio} a {mes_fin})", xaxis_title="Mes", yaxis_title="Monto ($)")
+        fig.update_layout(barmode='relative', title="Entradas vs Salidas Proyectadas", xaxis_title="Mes", yaxis_title="Monto ($)")
         st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No hay datos para graficar.")
 
 with tab2:
-    st.subheader("Base de Datos - Entradas de Efectivo (Activo)")
+    st.subheader("Base de Datos - Entradas (Activo)")
     st.dataframe(df_activo, use_container_width=True)
 
 with tab3:
-    st.subheader("Base de Datos - Salidas Proyectadas (Pasivo)")
+    st.subheader("Base de Datos - Salidas (Pasivo con Cálculo Exacto)")
     if not df_flujos_pasivo.empty:
         st.dataframe(df_flujos_pasivo.sort_values('Fecha'), use_container_width=True)
