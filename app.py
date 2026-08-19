@@ -3,7 +3,6 @@ import pandas as pd
 import datetime
 import plotly.graph_objects as go
 from streamlit_gsheets import GSheetsConnection
-from dateutil.relativedelta import relativedelta
 
 # ==========================================
 # 1. CONFIGURACIÓN DE LA PÁGINA
@@ -31,16 +30,32 @@ for mes in meses_proyectados:
     salidas_reales[mes] = st.sidebar.number_input(f"Retiro en {mes} ($)", min_value=0.0, value=0.0, step=50000.0)
 
 # ==========================================
-# 3. CONEXIÓN A GOOGLE SHEETS
+# 3. CONEXIÓN A GOOGLE SHEETS Y LIMPIEZA
 # ==========================================
 # IMPORTANTE: Mantén aquí tu URL real de "Tesoreria FEXCL"
 URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing"
+
+def limpiar_numeros(df, columnas):
+    """Limpia formatos de moneda y texto para convertirlos a números matemáticos puros."""
+    for col in columnas:
+        if col in df.columns:
+            # Reemplazamos símbolos de dinero, comas, porcentajes y espacios
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(r'[$,% ]', '', regex=True), 
+                errors='coerce'
+            ).fillna(0)
+    return df
 
 @st.cache_data(ttl=600)
 def cargar_datos_sheets():
     conn = st.connection("gsheets", type=GSheetsConnection)
     df_act = conn.read(spreadsheet=URL_SHEET, worksheet="Activo")
     df_pas = conn.read(spreadsheet=URL_SHEET, worksheet="Pasivo")
+    
+    # Aplicamos la limpieza robusta de números antes de cualquier cálculo
+    df_act = limpiar_numeros(df_act, ['Capital', 'Interés', 'Total'])
+    df_pas = limpiar_numeros(df_pas, ['Monto de Inversión', 'Monto Cupón', '% Rendimiento'])
+    
     return df_act, df_pas
 
 try:
@@ -65,16 +80,13 @@ def proyectar_flujos_pasivo(df):
         inicio = row['Fecha de inicio']
         fin = row['Fecha de vencimiento']
         
-        # Obtenemos la tasa por si se necesita para intereses
         tasa = row.get('% Rendimiento', 0)
-        if isinstance(tasa, str):
-            tasa = float(tasa.replace('%', '')) / 100
-        
-        # 4.1 Regla: Devolución Total al Final (Para Mensual o Al término)
+        if isinstance(tasa, (int, float)) and tasa > 1:
+            tasa = tasa / 100.0
+            
         if pd.notna(fin) and tipo_pago != 'Amortización':
             flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Capital', 'Monto': monto_inv})
         
-        # 4.2 Regla: Mensual (Solo Intereses)
         if tipo_pago == 'Mensual' and pd.notna(inicio) and pd.notna(fin):
             cupon = row.get('Monto Cupón', 0)
             fechas_pago = pd.date_range(start=inicio, end=fin, freq='MS') 
@@ -82,16 +94,12 @@ def proyectar_flujos_pasivo(df):
                 if fecha > inicio and fecha <= fin:
                     flujos.append({'Fecha': fecha, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': cupon})
                     
-        # 4.3 Regla: Al término
         elif tipo_pago == 'Al termino' and pd.notna(fin):
             interes_total = monto_inv * tasa 
             flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': interes_total})
             
-        # 4.4 Regla: Amortización (NUEVO: Capital en partes iguales)
         elif tipo_pago == 'Amortización' and pd.notna(inicio) and pd.notna(fin):
             fechas_pago = pd.date_range(start=inicio, end=fin, freq='MS')
-            
-            # Ajustamos al día de pago si existe
             try:
                 dia = int(str(row.get('Día pago cupón', '1')).replace('.0', '').strip())
                 fechas_pago = fechas_pago.map(lambda x: x.replace(day=min(dia, x.days_in_month)))
@@ -107,18 +115,13 @@ def proyectar_flujos_pasivo(df):
                 cupon = row.get('Monto Cupón', 0)
                 
                 for fecha in fechas_validas:
-                    # 1. Pago de Capital (parte igual)
-                    flujos.append({'Fecha': fecha, 'Fondeador': fondeador, 'Concepto': 'Amortización de Capital', 'Monto': capital_mensual})
-                    
-                    # 2. Pago de Interés
+                    flujos.append({'Fecha': fecha, 'Fondeador': fondeador, 'Concepto': 'Amortización Capital', 'Monto': capital_mensual})
                     if cupon > 0:
                         flujos.append({'Fecha': fecha, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': cupon})
                     elif tasa > 0:
-                        # Interés sobre saldo insoluto asumiendo tasa anual
                         interes_mes = saldo_insoluto * (tasa / 12)
                         flujos.append({'Fecha': fecha, 'Fondeador': fondeador, 'Concepto': 'Interés (S.I.)', 'Monto': interes_mes})
                     
-                    # Reducimos el saldo para el próximo mes
                     saldo_insoluto -= capital_mensual
 
     df_flujos = pd.DataFrame(flujos)
@@ -132,7 +135,6 @@ def proyectar_flujos_activo(df, morosidad):
     df = df.dropna(subset=['Fecha Fin']).copy()
     df['Mes-Año'] = df['Fecha Fin'].dt.to_period('M').astype(str)
     
-    # Aplicamos el castigo de morosidad a los cobros proyectados
     df['Cobro Esperado'] = df['Total'] * (1 - morosidad)
     flujos_mensuales = df.groupby('Mes-Año')['Cobro Esperado'].sum().reset_index()
     flujos_mensuales.rename(columns={'Cobro Esperado': 'Entradas (Activo)'}, inplace=True)
@@ -141,22 +143,20 @@ def proyectar_flujos_activo(df, morosidad):
 df_flujos_pasivo = proyectar_flujos_pasivo(df_pasivo)
 df_flujos_activo = proyectar_flujos_activo(df_activo, tasa_morosidad)
 
-# --- Consolidación Mensual (Incluyendo retiros manuales) ---
+# --- Consolidación Mensual ---
 if not df_flujos_pasivo.empty:
     salidas_mensuales = df_flujos_pasivo.groupby('Mes-Año')['Monto'].sum().reset_index()
     salidas_mensuales.rename(columns={'Monto': 'Salidas (Pasivo)'}, inplace=True)
 else:
     salidas_mensuales = pd.DataFrame(columns=['Mes-Año', 'Salidas (Pasivo)'])
 
-# Unimos Entradas y Salidas
 df_alm = pd.merge(df_flujos_activo, salidas_mensuales, on='Mes-Año', how='outer').fillna(0)
 
-# Sumamos los retiros manuales que pusiste en la barra lateral
+# Sumamos los retiros manuales
 for mes, retiro in salidas_reales.items():
     if mes in df_alm['Mes-Año'].values:
         df_alm.loc[df_alm['Mes-Año'] == mes, 'Salidas (Pasivo)'] += retiro
     elif retiro > 0:
-        # Si el mes no existía en proyecciones, lo agregamos
         nueva_fila = pd.DataFrame({'Mes-Año': [mes], 'Entradas (Activo)': [0], 'Salidas (Pasivo)': [retiro]})
         df_alm = pd.concat([df_alm, nueva_fila], ignore_index=True)
 
@@ -201,5 +201,4 @@ with tab2:
 with tab3:
     st.subheader("Base de Datos - Salidas Proyectadas (Pasivo)")
     if not df_flujos_pasivo.empty:
-        # Colocamos color distinto si es capital o interés
         st.dataframe(df_flujos_pasivo.sort_values('Fecha'), use_container_width=True)
