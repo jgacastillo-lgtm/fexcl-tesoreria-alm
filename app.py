@@ -24,6 +24,7 @@ tasa_morosidad = st.sidebar.slider(
 
 st.sidebar.subheader("Salidas No Renovadas (Pasivo)")
 st.sidebar.markdown("Capital que sabemos que NO se renovará (Afecta Liquidez):")
+# Proyectamos 6 meses a partir de hoy (Agosto 2026)
 meses_proyectados = [(datetime.date.today() + pd.DateOffset(months=i)).strftime('%Y-%m') for i in range(6)]
 salidas_reales = {}
 for mes in meses_proyectados:
@@ -39,7 +40,6 @@ def limpiar_numeros(df, columnas):
     """Limpia formatos de moneda y texto para convertirlos a números matemáticos puros."""
     for col in columnas:
         if col in df.columns:
-            # Reemplazamos símbolos de dinero, comas, porcentajes y espacios
             df[col] = pd.to_numeric(
                 df[col].astype(str).str.replace(r'[$,% ]', '', regex=True), 
                 errors='coerce'
@@ -52,7 +52,6 @@ def cargar_datos_sheets():
     df_act = conn.read(spreadsheet=URL_SHEET, worksheet="Activo")
     df_pas = conn.read(spreadsheet=URL_SHEET, worksheet="Pasivo")
     
-    # Aplicamos la limpieza robusta de números antes de cualquier cálculo
     df_act = limpiar_numeros(df_act, ['Capital', 'Interés', 'Total'])
     df_pas = limpiar_numeros(df_pas, ['Monto de Inversión', 'Monto Cupón', '% Rendimiento'])
     
@@ -186,13 +185,30 @@ with tab1:
     st.subheader("Gráfica de Liquidez Mensual (Calce de Plazos)")
     
     if not df_alm.empty:
-        fig = go.Figure()
-        fig.add_trace(go.Bar(x=df_alm['Mes-Año'], y=df_alm['Entradas (Activo)'], name='Entradas Esperadas (Cobranza)', marker_color='#2ca02c'))
-        fig.add_trace(go.Bar(x=df_alm['Mes-Año'], y=-df_alm['Salidas (Pasivo)'], name='Salidas Proyectadas (Fondeadores)', marker_color='#d62728'))
-        fig.add_trace(go.Scatter(x=df_alm['Mes-Año'], y=df_alm['Flujo Neto'], name='Flujo Neto del Mes', mode='lines+markers', line=dict(color='black', width=3)))
+        # --- NUEVO: Control de Rango de Fechas ---
+        meses_disponibles = sorted(df_alm['Mes-Año'].unique())
         
-        fig.update_layout(barmode='relative', title="Entradas vs Salidas Proyectadas", xaxis_title="Mes", yaxis_title="Monto ($)")
+        if len(meses_disponibles) > 1:
+            mes_inicio, mes_fin = st.select_slider(
+                "Selecciona el horizonte de tiempo que deseas analizar:",
+                options=meses_disponibles,
+                value=(meses_disponibles[0], meses_disponibles[-1])
+            )
+            # Filtramos el dataframe base según la selección del usuario
+            df_grafica = df_alm[(df_alm['Mes-Año'] >= mes_inicio) & (df_alm['Mes-Año'] <= mes_fin)]
+        else:
+            df_grafica = df_alm
+            
+        # Graficamos con los datos filtrados
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=df_grafica['Mes-Año'], y=df_grafica['Entradas (Activo)'], name='Entradas Esperadas (Cobranza)', marker_color='#2ca02c'))
+        fig.add_trace(go.Bar(x=df_grafica['Mes-Año'], y=-df_grafica['Salidas (Pasivo)'], name='Salidas Proyectadas (Fondeadores)', marker_color='#d62728'))
+        fig.add_trace(go.Scatter(x=df_grafica['Mes-Año'], y=df_grafica['Flujo Neto'], name='Flujo Neto del Mes', mode='lines+markers', line=dict(color='black', width=3)))
+        
+        fig.update_layout(barmode='relative', title=f"Entradas vs Salidas Proyectadas ({mes_inicio} a {mes_fin})", xaxis_title="Mes", yaxis_title="Monto ($)")
         st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No hay datos para graficar.")
 
 with tab2:
     st.subheader("Base de Datos - Entradas de Efectivo (Activo)")
