@@ -1,58 +1,36 @@
 import streamlit as st
 import pandas as pd
+from streamlit_gsheets import GSheetsConnection
 import datetime
 
-# 1. Configuración básica de la página
-st.set_page_config(page_title="FEXCL Control de Tesorería", page_icon="📈", layout="wide")
+st.set_page_config(page_title="FEXCL Tesorería", layout="wide")
 st.title("📊 FEX CAPITAL Loans - Módulo de Tesorería y ALM")
-st.markdown("Proyección de Liquidez y Calce de Plazos (Activo vs Pasivo)")
 
-# 2. Barra lateral (Sidebar) para los controles y supuestos del modelo
-st.sidebar.header("⚙️ Supuestos del Modelo")
+# --- 1. CONEXIÓN A GOOGLE SHEETS ---
+# Pega aquí la URL completa de tu archivo "Tesoreria FEXCL"
+URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing"
 
-# Control de Tasa de Morosidad (NPL)
-st.sidebar.subheader("Riesgo de Cartera")
-tasa_morosidad = st.sidebar.slider(
-    "Tasa de Morosidad (Impago proyectado en el Activo)", 
-    min_value=0.0, 
-    max_value=30.0, 
-    value=5.0, 
-    step=0.5,
-    format="%f%%"
-) / 100.0
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-# 3. Módulo de Renovación de Fondeadores (Roll-over)
-st.sidebar.subheader("Salidas No Renovadas (Pasivo)")
-st.sidebar.markdown("Ingresa el monto de capital que **sabes que NO se va a renovar** por mes (retiro real de liquidez).")
+try:
+    # Leemos las dos hojas (ajusta los nombres si tus pestañas se llaman distinto)
+    df_activo = conn.read(spreadsheet=URL_SHEET, worksheet="Activo")
+    df_pasivo = conn.read(spreadsheet=URL_SHEET, worksheet="Pasivo")
+    st.success("¡Datos de FEX CAPITAL Loans conectados exitosamente!")
+except Exception as e:
+    st.error(f"Error al conectar con Google Sheets. Revisa tus Secrets. Detalle: {e}")
+    st.stop()
 
-# Generamos dinámicamente los próximos 6 meses para el input manual
-meses_proyectados = [(datetime.date.today() + pd.DateOffset(months=i)).strftime('%Y-%m') for i in range(6)]
-salidas_reales = {}
-
-for mes in meses_proyectados:
-    salidas_reales[mes] = st.sidebar.number_input(
-        f"Retiro de Capital en {mes} ($)", 
-        min_value=0.0, 
-        value=0.0, 
-        step=50000.0,
-        format="%f"
-    )
-
-# 4. Esqueleto de las Pestañas de Visualización
+# --- 2. MOSTRAR DATOS CRUDOS ---
 tab1, tab2, tab3 = st.tabs(["Balance Proyectado", "Flujos del Activo", "Flujos del Pasivo"])
 
 with tab1:
-    st.subheader("Liquidez Neta Acumulada")
-    st.info("Aquí insertaremos la gráfica principal que cruzará las entradas menos las salidas, aplicando la morosidad del {}%".format(tasa_morosidad * 100))
+    st.write("Próximamente: Cálculos de Liquidez ALM")
 
 with tab2:
-    st.subheader("Entradas de Efectivo (Activo)")
-    st.write("Aquí cargaremos y agruparemos la hoja de Activos.")
+    st.subheader("Base de Datos - Activo (Nuestra Cartera)")
+    st.dataframe(df_activo.head(10)) # Mostramos solo 10 para probar
 
 with tab3:
-    st.subheader("Salidas de Efectivo (Pasivo)")
-    st.write("Aquí programaremos el motor que calculará los cupones y vencimientos según el tipo de fondeo.")
-
-# Por ahora, mostramos en pantalla el diccionario de los retiros manuales para confirmar que funciona
-st.sidebar.divider()
-st.sidebar.write("Resumen de Retiros Manuales:", salidas_reales)
+    st.subheader("Base de Datos - Pasivo (Nuestros Fondeadores)")
+    st.dataframe(df_pasivo)
