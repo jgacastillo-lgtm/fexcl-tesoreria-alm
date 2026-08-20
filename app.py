@@ -8,9 +8,8 @@ from dateutil.relativedelta import relativedelta
 # ==========================================
 # 1. CONFIGURACIÓN DE LA PÁGINA E IDENTIDAD
 # ==========================================
-st.set_page_config(page_title="FEXCL Tesorería", layout="wide")
+st.set_page_config(page_title="Tesorería y ALM", layout="wide")
 
-# Logo corporativo cargado directamente desde el repositorio
 st.image("LOGO_FEX.png", width=300) 
 
 st.title("Módulo de Tesorería y ALM")
@@ -36,7 +35,7 @@ for mes in meses_proyectados:
 # ==========================================
 # 3. CONEXIÓN A GOOGLE SHEETS Y LIMPIEZA
 # ==========================================
-URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing" # <-- Recuerda pegar tu URL real de Google Sheets aquí
+URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing" # Reemplaza con tu URL
 
 def limpiar_numeros(df, columnas):
     for col in columnas:
@@ -69,6 +68,12 @@ def cargar_datos_sheets():
         df_pas['Tasa Decimal'] = df_pas['% Rendimiento'].apply(limpiar_tasa)
     else:
         df_pas['Tasa Decimal'] = 0.0
+        
+    # Limpieza de la tasa del activo si es que ya se agregó la columna
+    if 'Tasa' in df_act.columns:
+        df_act['Tasa Decimal Activo'] = df_act['Tasa'].apply(limpiar_tasa)
+    else:
+        df_act['Tasa Decimal Activo'] = 0.0
         
     return df_act, df_pas
 
@@ -104,19 +109,15 @@ def proyectar_flujos_pasivo(df):
             
             while True:
                 fecha_actual = inicio + relativedelta(months=meses_agregados)
-                
                 try:
                     dia = int(str(row.get('Día pago cupón', '0')).replace('.0', '').strip())
                     if dia > 0:
                         fecha_actual = fecha_actual.replace(day=min(dia, fecha_actual.days_in_month))
-                except:
-                    pass
+                except: pass
                 
                 if fecha_actual > fin:
-                    if fecha_anterior < fin:
-                        fecha_actual = fin
-                    else:
-                        break
+                    if fecha_anterior < fin: fecha_actual = fin
+                    else: break
                 
                 dias_naturales = (fecha_actual - fecha_anterior).days
                 interes = (tasa / 360.0) * dias_naturales * monto_inv
@@ -124,9 +125,7 @@ def proyectar_flujos_pasivo(df):
                 if interes > 0:
                     flujos.append({'Fecha': fecha_actual, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': interes})
                 
-                if fecha_actual == fin:
-                    break
-                    
+                if fecha_actual == fin: break
                 fecha_anterior = fecha_actual
                 meses_agregados += 1
                 
@@ -142,14 +141,11 @@ def proyectar_flujos_pasivo(df):
                 f_pago = inicio + relativedelta(months=m)
                 try:
                     dia = int(str(row.get('Día pago cupón', '0')).replace('.0', '').strip())
-                    if dia > 0:
-                        f_pago = f_pago.replace(day=min(dia, f_pago.days_in_month))
-                except:
-                    pass
+                    if dia > 0: f_pago = f_pago.replace(day=min(dia, f_pago.days_in_month))
+                except: pass
                     
                 if f_pago > fin:
-                    if f_pago != fin and (inicio + relativedelta(months=m-1)) < fin:
-                        fechas_pago.append(fin)
+                    if f_pago != fin and (inicio + relativedelta(months=m-1)) < fin: fechas_pago.append(fin)
                     break
                 fechas_pago.append(f_pago)
                 m += 1
@@ -162,21 +158,21 @@ def proyectar_flujos_pasivo(df):
                 
                 for f_actual in fechas_pago:
                     flujos.append({'Fecha': f_actual, 'Fondeador': fondeador, 'Concepto': 'Amortización Capital', 'Monto': capital_mensual})
-                    
                     if tasa > 0:
                         dias_naturales = (f_actual - fecha_anterior).days
                         interes_s_i = (tasa / 360.0) * dias_naturales * saldo_insoluto
-                        flujos.append({'Fecha': f_actual, 'Fondeador': fondeador, 'Concepto': 'Interés S.I.', 'Monto': interes_s_i})
-                        
+                        flujos.append({'Fecha': f_actual, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': interes_s_i})
                     saldo_insoluto -= capital_mensual
                     fecha_anterior = f_actual
 
     df_flujos = pd.DataFrame(flujos)
     if not df_flujos.empty:
         df_flujos['Mes-Año'] = df_flujos['Fecha'].dt.to_period('M').astype(str)
+        df_flujos['Categoria'] = df_flujos['Concepto'].apply(
+            lambda x: 'Intereses' if 'Interés' in x else ('Amortización' if 'Amortización' in x else 'Devolución Capital')
+        )
     return df_flujos
 
-# --- Motor del Activo ---
 def proyectar_flujos_activo(df, morosidad):
     df['Fecha Fin'] = pd.to_datetime(df['Fecha Fin'], dayfirst=True, errors='coerce')
     df = df.dropna(subset=['Fecha Fin']).copy()
@@ -192,27 +188,28 @@ df_flujos_activo = proyectar_flujos_activo(df_activo, tasa_morosidad)
 
 # --- Consolidación Mensual ---
 if not df_flujos_pasivo.empty:
-    salidas_mensuales = df_flujos_pasivo.groupby('Mes-Año')['Monto'].sum().reset_index()
-    salidas_mensuales.rename(columns={'Monto': 'Salidas (Pasivo)'}, inplace=True)
+    salidas_pivot = df_flujos_pasivo.groupby(['Mes-Año', 'Categoria'])['Monto'].sum().unstack(fill_value=0).reset_index()
+    for col in ['Intereses', 'Amortización', 'Devolución Capital']:
+        if col not in salidas_pivot.columns:
+            salidas_pivot[col] = 0.0
 else:
-    salidas_mensuales = pd.DataFrame(columns=['Mes-Año', 'Salidas (Pasivo)'])
+    salidas_pivot = pd.DataFrame(columns=['Mes-Año', 'Intereses', 'Amortización', 'Devolución Capital'])
 
-df_alm = pd.merge(df_flujos_activo, salidas_mensuales, on='Mes-Año', how='outer').fillna(0)
+df_alm = pd.merge(df_flujos_activo, salidas_pivot, on='Mes-Año', how='outer').fillna(0)
 
-# Integración de Salidas Manuales
 for mes, retiro in salidas_reales.items():
     if mes in df_alm['Mes-Año'].values:
-        df_alm.loc[df_alm['Mes-Año'] == mes, 'Salidas (Pasivo)'] += retiro
+        df_alm.loc[df_alm['Mes-Año'] == mes, 'Devolución Capital'] += retiro
     elif retiro > 0:
-        nueva_fila = pd.DataFrame({'Mes-Año': [mes], 'Entradas (Activo)': [0], 'Salidas (Pasivo)': [retiro]})
+        nueva_fila = pd.DataFrame({'Mes-Año': [mes], 'Entradas (Activo)': [0], 'Intereses': [0], 'Amortización': [0], 'Devolución Capital': [retiro]})
         df_alm = pd.concat([df_alm, nueva_fila], ignore_index=True)
 
 df_alm = df_alm.sort_values('Mes-Año')
-df_alm['Flujo Neto'] = df_alm['Entradas (Activo)'] - df_alm['Salidas (Pasivo)']
+df_alm['Salidas Totales'] = df_alm['Intereses'] + df_alm['Amortización'] + df_alm['Devolución Capital']
+df_alm['Flujo Neto'] = df_alm['Entradas (Activo)'] - df_alm['Salidas Totales']
 
-# --- Formato Visual para Gráfica (k y m) ---
 def formatear_cifra(val):
-    if pd.isna(val): return "0k"
+    if pd.isna(val) or val == 0: return ""
     abs_val = abs(val)
     signo = "-" if val < 0 else ""
     if abs_val >= 1_000_000:
@@ -222,25 +219,43 @@ def formatear_cifra(val):
     else:
         return f"{signo}{int(abs_val)}"
 
-if not df_alm.empty:
-    df_alm['Etiqueta Visual'] = df_alm['Flujo Neto'].apply(formatear_cifra)
+# ==========================================
+# 5. CÁLCULO DE TASAS Y MÁRGENES
+# ==========================================
+# La Cartera Viva total asume que el CSV solo contiene los pagos futuros pendientes
+total_activo = df_activo['Capital'].sum() if 'Capital' in df_activo.columns else 0
+total_pasivo = df_pasivo['Monto de Inversión'].sum() if 'Monto de Inversión' in df_pasivo.columns else 0
+flujo_proximo_mes = df_alm['Flujo Neto'].iloc[0] if not df_alm.empty else 0
+
+# Tasa Ponderada del Activo (Requiere columna 'Tasa' en tu Google Sheets)
+tasa_pond_act = 0.0
+if 'Tasa Decimal Activo' in df_activo.columns and total_activo > 0:
+    tasa_pond_act = (df_activo['Capital'] * df_activo['Tasa Decimal Activo']).sum() / total_activo
+
+tasa_pond_pas = 0.0
+if not df_pasivo.empty and total_pasivo > 0:
+    tasa_pond_pas = (df_pasivo['Monto de Inversión'] * df_pasivo['Tasa Decimal']).sum() / total_pasivo
 
 # ==========================================
-# 5. DASHBOARD Y VISUALIZACIÓN
+# 6. DASHBOARD Y VISUALIZACIÓN
 # ==========================================
 tab1, tab2, tab3 = st.tabs(["Centro de Mando", "Detalle Activo", "Detalle Pasivo"])
 
 with tab1:
     st.header("Indicadores Clave (KPIs)")
-    total_activo = df_activo['Capital'].sum() if 'Capital' in df_activo.columns else 0
-    total_pasivo = df_pasivo['Monto de Inversión'].sum() if 'Monto de Inversión' in df_pasivo.columns else 0
-    flujo_proximo_mes = df_alm['Flujo Neto'].iloc[0] if not df_alm.empty else 0
     
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Cartera Viva", f"${total_activo:,.2f}")
-    col2.metric("Fondeo Total", f"${total_pasivo:,.2f}")
-    col3.metric("Tasa Morosidad", f"{tasa_morosidad*100:.1f}%")
-    col4.metric("Flujo Neto (Próx. Mes)", f"${flujo_proximo_mes:,.2f}")
+    
+    if 'Tasa' in df_activo.columns:
+        col2.metric("Tasa Pond. Activo", f"{tasa_pond_act*100:.2f}%")
+        col5.metric("Margen Financiero", f"{(tasa_pond_act - tasa_pond_pas)*100:.2f}%")
+    else:
+        col2.metric("Tasa Pond. Activo", "Sin Columna 'Tasa'")
+        col5.metric("Margen Financiero", "Requiere Tasa Activa")
+        
+    col3.metric("Fondeo Total", f"${total_pasivo:,.2f}")
+    col4.metric("Tasa Pond. Pasivo", f"{tasa_pond_pas*100:.2f}%")
 
     st.divider()
     st.subheader("Gráfica de Liquidez Mensual")
@@ -249,27 +264,44 @@ with tab1:
         meses_disponibles = sorted(df_alm['Mes-Año'].unique())
         if len(meses_disponibles) > 1:
             mes_inicio, mes_fin = st.select_slider("Selecciona el horizonte de tiempo:", options=meses_disponibles, value=(meses_disponibles[0], meses_disponibles[-1]))
-            df_grafica = df_alm[(df_alm['Mes-Año'] >= mes_inicio) & (df_alm['Mes-Año'] <= mes_fin)]
+            df_grafica = df_alm[(df_alm['Mes-Año'] >= mes_inicio) & (df_alm['Mes-Año'] <= mes_fin)].copy()
         else:
-            df_grafica = df_alm
+            df_grafica = df_alm.copy()
             
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=df_grafica['Mes-Año'], y=df_grafica['Entradas (Activo)'], name='Entradas (Cobranza)', marker_color='#2ca02c'))
-        fig.add_trace(go.Bar(x=df_grafica['Mes-Año'], y=-df_grafica['Salidas (Pasivo)'], name='Salidas (Fondeadores)', marker_color='#d62728'))
         
-        # Línea de flujo neto con las etiquetas de K o M
-        fig.add_trace(go.Scatter(
-            x=df_grafica['Mes-Año'], 
-            y=df_grafica['Flujo Neto'], 
-            name='Flujo Neto del Mes', 
-            mode='lines+markers+text', 
-            text=df_grafica['Etiqueta Visual'],
-            textposition='top center',
-            textfont=dict(size=12, color='black'),
-            line=dict(color='black', width=3)
+        fig.add_trace(go.Bar(
+            x=df_grafica['Mes-Año'], y=df_grafica['Entradas (Activo)'], 
+            name='Entradas (Cobranza)', marker_color='#2ca02c',
+            text=df_grafica['Entradas (Activo)'].apply(formatear_cifra), textposition='inside'
         ))
         
-        fig.update_layout(barmode='relative', title="Entradas vs Salidas Proyectadas", xaxis_title="Mes", yaxis_title="Monto ($)")
+        fig.add_trace(go.Bar(
+            x=df_grafica['Mes-Año'], y=-df_grafica['Intereses'], 
+            name='Pago de Intereses', marker_color='#fdb863',
+            text=df_grafica['Intereses'].apply(formatear_cifra), textposition='inside'
+        ))
+        
+        fig.add_trace(go.Bar(
+            x=df_grafica['Mes-Año'], y=-df_grafica['Amortización'], 
+            name='Amortizaciones', marker_color='#e66101',
+            text=df_grafica['Amortización'].apply(formatear_cifra), textposition='inside'
+        ))
+        
+        fig.add_trace(go.Bar(
+            x=df_grafica['Mes-Año'], y=-df_grafica['Devolución Capital'], 
+            name='Devolución Capital', marker_color='#b2182b',
+            text=df_grafica['Devolución Capital'].apply(formatear_cifra), textposition='inside'
+        ))
+        
+        fig.add_trace(go.Scatter(
+            x=df_grafica['Mes-Año'], y=df_grafica['Flujo Neto'], 
+            name='Flujo Neto del Mes', mode='lines+markers+text', 
+            text=df_grafica['Flujo Neto'].apply(formatear_cifra), textposition='top center',
+            textfont=dict(size=12, color='black'), line=dict(color='black', width=3)
+        ))
+        
+        fig.update_layout(barmode='relative', title="Desglose de Entradas vs Salidas", xaxis_title="Mes", yaxis_title="Monto ($)", height=600)
         st.plotly_chart(fig, use_container_width=True)
 
 with tab2:
