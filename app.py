@@ -3,6 +3,7 @@ import pandas as pd
 import datetime
 import plotly.graph_objects as go
 from streamlit_gsheets import GSheetsConnection
+from dateutil.relativedelta import relativedelta
 
 # ==========================================
 # 1. CONFIGURACIÓN DE LA PÁGINA
@@ -22,6 +23,7 @@ tasa_morosidad = st.sidebar.slider(
 ) / 100.0
 
 st.sidebar.subheader("Salidas No Renovadas (Pasivo)")
+st.sidebar.markdown("Capital que sabemos que NO se renovará:")
 meses_proyectados = [(datetime.date.today() + pd.DateOffset(months=i)).strftime('%Y-%m') for i in range(6)]
 salidas_reales = {}
 for mes in meses_proyectados:
@@ -30,16 +32,27 @@ for mes in meses_proyectados:
 # ==========================================
 # 3. CONEXIÓN A GOOGLE SHEETS Y LIMPIEZA
 # ==========================================
-URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing" # Pega tu URL aquí
+URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing" # <-- Pega tu URL de Google Sheets aquí
 
 def limpiar_numeros(df, columnas):
     for col in columnas:
         if col in df.columns:
             df[col] = pd.to_numeric(
-                df[col].astype(str).str.replace(r'[$,% ]', '', regex=True), 
+                df[col].astype(str).str.replace(r'[$, ]', '', regex=True), 
                 errors='coerce'
             ).fillna(0)
     return df
+
+def limpiar_tasa(val):
+    """Convierte la columna de % Rendimiento (ej. '17.00%') en decimal (0.17)"""
+    if pd.isna(val): return 0.0
+    try:
+        val_str = str(val).replace('%', '').strip()
+        tasa = float(val_str)
+        # Si la tasa viene como 17 o 18 en lugar de 0.17, la dividimos
+        return tasa / 100.0 if tasa > 1 else tasa
+    except:
+        return 0.0
 
 @st.cache_data(ttl=600)
 def cargar_datos_sheets():
@@ -47,8 +60,16 @@ def cargar_datos_sheets():
     df_act = conn.read(spreadsheet=URL_SHEET, worksheet="Activo")
     df_pas = conn.read(spreadsheet=URL_SHEET, worksheet="Pasivo")
     
+    # Limpieza de montos
     df_act = limpiar_numeros(df_act, ['Capital', 'Interés', 'Total'])
-    df_pas = limpiar_numeros(df_pas, ['Monto de Inversión', '% Rendimiento'])
+    df_pas = limpiar_numeros(df_pas, ['Monto de Inversión'])
+    
+    # Limpieza de la tasa de rendimiento (Columna D)
+    if '% Rendimiento' in df_pas.columns:
+        df_pas['Tasa Decimal'] = df_pas['% Rendimiento'].apply(limpiar_tasa)
+    else:
+        df_pas['Tasa Decimal'] = 0.0
+        
     return df_act, df_pas
 
 try:
@@ -60,84 +81,103 @@ except Exception as e:
 # ==========================================
 # 4. MOTORES DE PROYECCIÓN (ALM) EXACTOS
 # ==========================================
-DIAS_BASE = 360 # Base comercial estándar para cálculo de tasas anualizadas
-
 def proyectar_flujos_pasivo(df):
     flujos = []
-    df['Fecha de inicio'] = pd.to_datetime(df['Fecha de inicio'], errors='coerce')
-    df['Fecha de vencimiento'] = pd.to_datetime(df['Fecha de vencimiento'], errors='coerce')
+    
+    # IMPORTANTE: dayfirst=True fuerza a Python a leer formato México (DD/MM/YYYY)
+    df['Fecha de inicio'] = pd.to_datetime(df['Fecha de inicio'], dayfirst=True, errors='coerce')
+    df['Fecha de vencimiento'] = pd.to_datetime(df['Fecha de vencimiento'], dayfirst=True, errors='coerce')
     
     for index, row in df.iterrows():
-        fondeador = row['Fondeador']
+        fondeador = row.get('Fondeador', 'Desconocido')
         monto_inv = row.get('Monto de Inversión', 0)
         tipo_pago = row.get('Pago Rendimiento', '')
         inicio = row['Fecha de inicio']
         fin = row['Fecha de vencimiento']
-        
-        # Validar y formatear la tasa
-        tasa = row.get('% Rendimiento', 0)
-        if isinstance(tasa, (int, float)) and tasa > 1:
-            tasa = tasa / 100.0
+        tasa = row.get('Tasa Decimal', 0)
             
-        # 1. Capital Total al Final (para Mensual o Al término)
+        # Regla 1: Devolución de Capital al final
         if pd.notna(fin) and tipo_pago != 'Amortización':
-            flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Capital', 'Monto': monto_inv})
+            flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Devolución Capital', 'Monto': monto_inv})
         
-        # 2. ESQUEMA MENSUAL (Interés por días exactos transcurridos)
+        # Regla 2: Esquema MENSUAL (Cálculo exacto: (Tasa/360) * Días * Monto)
         if tipo_pago == 'Mensual' and pd.notna(inicio) and pd.notna(fin):
-            fechas_pago = pd.date_range(start=inicio, end=fin, freq='MS')
-            
-            # Ajustamos al día de pago si existe
-            try:
-                dia = int(str(row.get('Día pago cupón', '1')).replace('.0', '').strip())
-                fechas_pago = fechas_pago.map(lambda x: x.replace(day=min(dia, x.days_in_month)))
-            except:
-                pass
-                
             fecha_anterior = inicio
-            for fecha_actual in fechas_pago:
-                if fecha_actual > inicio and fecha_actual <= fin:
-                    # Cálculo matemático exacto
-                    dias_transcurridos = (fecha_actual - fecha_anterior).days
-                    interes_calculado = monto_inv * (tasa / DIAS_BASE) * dias_transcurridos
+            meses_agregados = 1
+            
+            while True:
+                fecha_actual = inicio + relativedelta(months=meses_agregados)
+                
+                # Ajustamos al día de pago si existe en la columna
+                try:
+                    dia = int(str(row.get('Día pago cupón', '0')).replace('.0', '').strip())
+                    if dia > 0:
+                        fecha_actual = fecha_actual.replace(day=min(dia, fecha_actual.days_in_month))
+                except:
+                    pass
+                
+                # Si la fecha calculada supera el vencimiento, garantizamos que el último pago se haga en la fecha de fin
+                if fecha_actual > fin:
+                    if fecha_anterior < fin:
+                        fecha_actual = fin
+                    else:
+                        break
+                
+                # Fórmula Financiera FEX CAPITAL: (Tasa / 360) * Días Naturales * Monto
+                dias_naturales = (fecha_actual - fecha_anterior).days
+                interes = (tasa / 360.0) * dias_naturales * monto_inv
+                
+                if interes > 0:
+                    flujos.append({'Fecha': fecha_actual, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': interes})
+                
+                if fecha_actual == fin:
+                    break
                     
-                    flujos.append({'Fecha': fecha_actual, 'Fondeador': fondeador, 'Concepto': 'Interés (Calculado)', 'Monto': interes_calculado})
-                    fecha_anterior = fecha_actual # Se actualiza para el siguiente ciclo
-                    
-        # 3. ESQUEMA AL TÉRMINO (Interés por días totales transcurridos)
+                fecha_anterior = fecha_actual
+                meses_agregados += 1
+                
+        # Regla 3: Esquema AL TÉRMINO
         elif tipo_pago == 'Al termino' and pd.notna(inicio) and pd.notna(fin):
             dias_totales = (fin - inicio).days
-            interes_total = monto_inv * (tasa / DIAS_BASE) * dias_totales
+            interes_total = (tasa / 360.0) * dias_totales * monto_inv
+            flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': interes_total})
             
-            flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Interés (Calculado)', 'Monto': interes_total})
-            
-        # 4. ESQUEMA AMORTIZACIÓN
+        # Regla 4: Esquema AMORTIZACIÓN (Partes iguales)
         elif tipo_pago == 'Amortización' and pd.notna(inicio) and pd.notna(fin):
-            fechas_pago = pd.date_range(start=inicio, end=fin, freq='MS')
-            try:
-                dia = int(str(row.get('Día pago cupón', '1')).replace('.0', '').strip())
-                fechas_pago = fechas_pago.map(lambda x: x.replace(day=min(dia, x.days_in_month)))
-            except:
-                pass
+            fechas_pago = []
+            m = 1
+            while True:
+                f_pago = inicio + relativedelta(months=m)
+                try:
+                    dia = int(str(row.get('Día pago cupón', '0')).replace('.0', '').strip())
+                    if dia > 0:
+                        f_pago = f_pago.replace(day=min(dia, f_pago.days_in_month))
+                except:
+                    pass
+                    
+                if f_pago > fin:
+                    if f_pago != fin and (inicio + relativedelta(months=m-1)) < fin:
+                        fechas_pago.append(fin)
+                    break
+                fechas_pago.append(f_pago)
+                m += 1
             
-            fechas_validas = [f for f in fechas_pago if f > inicio and f <= fin]
-            num_pagos = len(fechas_validas)
-            
+            num_pagos = len(fechas_pago)
             if num_pagos > 0:
                 capital_mensual = monto_inv / num_pagos
                 saldo_insoluto = monto_inv
                 fecha_anterior = inicio
                 
-                for fecha_actual in fechas_validas:
-                    flujos.append({'Fecha': fecha_actual, 'Fondeador': fondeador, 'Concepto': 'Amortización Capital', 'Monto': capital_mensual})
+                for f_actual in fechas_pago:
+                    flujos.append({'Fecha': f_actual, 'Fondeador': fondeador, 'Concepto': 'Amortización Capital', 'Monto': capital_mensual})
                     
                     if tasa > 0:
-                        dias_transcurridos = (fecha_actual - fecha_anterior).days
-                        interes_mes = saldo_insoluto * (tasa / DIAS_BASE) * dias_transcurridos
-                        flujos.append({'Fecha': fecha_actual, 'Fondeador': fondeador, 'Concepto': 'Interés (Calculado S.I.)', 'Monto': interes_mes})
-                    
+                        dias_naturales = (f_actual - fecha_anterior).days
+                        interes_s_i = (tasa / 360.0) * dias_naturales * saldo_insoluto
+                        flujos.append({'Fecha': f_actual, 'Fondeador': fondeador, 'Concepto': 'Interés S.I.', 'Monto': interes_s_i})
+                        
                     saldo_insoluto -= capital_mensual
-                    fecha_anterior = fecha_actual
+                    fecha_anterior = f_actual
 
     df_flujos = pd.DataFrame(flujos)
     if not df_flujos.empty:
@@ -146,7 +186,8 @@ def proyectar_flujos_pasivo(df):
 
 # --- Motor del Activo ---
 def proyectar_flujos_activo(df, morosidad):
-    df['Fecha Fin'] = pd.to_datetime(df['Fecha Fin'], errors='coerce')
+    # Formato México para el activo también
+    df['Fecha Fin'] = pd.to_datetime(df['Fecha Fin'], dayfirst=True, errors='coerce')
     df = df.dropna(subset=['Fecha Fin']).copy()
     df['Mes-Año'] = df['Fecha Fin'].dt.to_period('M').astype(str)
     
@@ -167,6 +208,7 @@ else:
 
 df_alm = pd.merge(df_flujos_activo, salidas_mensuales, on='Mes-Año', how='outer').fillna(0)
 
+# Integración de Salidas Manuales
 for mes, retiro in salidas_reales.items():
     if mes in df_alm['Mes-Año'].values:
         df_alm.loc[df_alm['Mes-Año'] == mes, 'Salidas (Pasivo)'] += retiro
@@ -176,7 +218,6 @@ for mes, retiro in salidas_reales.items():
 
 df_alm = df_alm.sort_values('Mes-Año')
 df_alm['Flujo Neto'] = df_alm['Entradas (Activo)'] - df_alm['Salidas (Pasivo)']
-df_alm['Liquidez Acumulada'] = df_alm['Flujo Neto'].cumsum()
 
 # ==========================================
 # 5. DASHBOARD Y VISUALIZACIÓN
@@ -221,4 +262,8 @@ with tab2:
 with tab3:
     st.subheader("Base de Datos - Salidas (Pasivo con Cálculo Exacto)")
     if not df_flujos_pasivo.empty:
-        st.dataframe(df_flujos_pasivo.sort_values('Fecha'), use_container_width=True)
+        # Formateamos los montos para que se vean como moneda en la tabla
+        df_flujos_pasivo_display = df_flujos_pasivo.sort_values('Fecha').copy()
+        df_flujos_pasivo_display['Fecha'] = df_flujos_pasivo_display['Fecha'].dt.strftime('%d/%m/%Y')
+        df_flujos_pasivo_display['Monto'] = df_flujos_pasivo_display['Monto'].apply(lambda x: f"${x:,.2f}")
+        st.dataframe(df_flujos_pasivo_display, use_container_width=True)
