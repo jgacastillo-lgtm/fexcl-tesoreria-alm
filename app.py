@@ -35,32 +35,27 @@ for mes in meses_proyectados:
 # ==========================================
 # 3. CONEXIÓN A GOOGLE SHEETS Y LIMPIEZA
 # ==========================================
-URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing" # Reemplaza con tu URL
+URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing" # <-- RECUERDA PONER TU URL REAL AQUÍ
 
 def limpiar_numeros(df, columnas):
-    for col in columnas:
-        if col in df.columns:
-            df[col] = pd.to_numeric(
-                df[col].astype(str).str.replace(r'[$, ]', '', regex=True), 
-                errors='coerce'
-            ).fillna(0)
+    # Buscamos las columnas de forma flexible (ignorando espacios)
+    cols_reales = df.columns.tolist()
+    for col_buscada in columnas:
+        for col_real in cols_reales:
+            if col_buscada.lower() == col_real.lower().strip():
+                df[col_real] = pd.to_numeric(
+                    df[col_real].astype(str).str.replace(r'[$, ]', '', regex=True), 
+                    errors='coerce'
+                ).fillna(0)
     return df
 
-def limpiar_tasa_pasivo(val):
-    if pd.isna(val): return 0.0
+def limpiar_tasa(val):
+    if pd.isna(val) or val == "": return 0.0
     try:
         val_str = str(val).replace('%', '').strip()
         tasa = float(val_str)
-        return tasa / 100.0 if tasa > 1 else tasa
-    except:
-        return 0.0
-
-def limpiar_tasa_activo(val):
-    if pd.isna(val): return 0.0
-    try:
-        val_str = str(val).replace('%', '').strip()
-        tasa = float(val_str)
-        return tasa / 100.0
+        # Si la tasa es mayor o igual a 1 (ej. 38), la dividimos para hacerla decimal (0.38)
+        return tasa / 100.0 if tasa >= 1 else tasa
     except:
         return 0.0
 
@@ -70,16 +65,24 @@ def cargar_datos_sheets():
     df_act = conn.read(spreadsheet=URL_SHEET, worksheet="Activo")
     df_pas = conn.read(spreadsheet=URL_SHEET, worksheet="Pasivo")
     
+    # Blindaje 1: Quitamos espacios invisibles de TODOS los encabezados
+    df_act.columns = df_act.columns.str.strip()
+    df_pas.columns = df_pas.columns.str.strip()
+    
     df_act = limpiar_numeros(df_act, ['Capital', 'Interés', 'Total'])
     df_pas = limpiar_numeros(df_pas, ['Monto de Inversión'])
     
-    if '% Rendimiento' in df_pas.columns:
-        df_pas['Tasa Decimal'] = df_pas['% Rendimiento'].apply(limpiar_tasa_pasivo)
+    # Limpieza Tasa Pasivo
+    col_rendimiento = [c for c in df_pas.columns if 'rendimiento' in c.lower()]
+    if col_rendimiento:
+        df_pas['Tasa Decimal Pasivo'] = df_pas[col_rendimiento[0]].apply(limpiar_tasa)
     else:
-        df_pas['Tasa Decimal'] = 0.0
+        df_pas['Tasa Decimal Pasivo'] = 0.0
         
-    if 'Tasa' in df_act.columns:
-        df_act['Tasa Decimal Activo'] = df_act['Tasa'].apply(limpiar_tasa_activo)
+    # Blindaje 2: Búsqueda flexible de la columna "Tasa" en el Activo
+    col_tasa_act = [c for c in df_act.columns if c.lower() == 'tasa']
+    if col_tasa_act:
+        df_act['Tasa Decimal Activo'] = df_act[col_tasa_act[0]].apply(limpiar_tasa)
     else:
         df_act['Tasa Decimal Activo'] = 0.0
         
@@ -96,17 +99,19 @@ except Exception as e:
 # ==========================================
 def proyectar_flujos_pasivo(df):
     flujos = []
+    col_inicio = [c for c in df.columns if 'inicio' in c.lower()][0] if [c for c in df.columns if 'inicio' in c.lower()] else 'Fecha de inicio'
+    col_fin = [c for c in df.columns if 'vencimiento' in c.lower()][0] if [c for c in df.columns if 'vencimiento' in c.lower()] else 'Fecha de vencimiento'
     
-    df['Fecha de inicio'] = pd.to_datetime(df['Fecha de inicio'], dayfirst=True, errors='coerce')
-    df['Fecha de vencimiento'] = pd.to_datetime(df['Fecha de vencimiento'], dayfirst=True, errors='coerce')
+    df[col_inicio] = pd.to_datetime(df[col_inicio], dayfirst=True, errors='coerce')
+    df[col_fin] = pd.to_datetime(df[col_fin], dayfirst=True, errors='coerce')
     
     for index, row in df.iterrows():
         fondeador = row.get('Fondeador', 'Desconocido')
         monto_inv = row.get('Monto de Inversión', 0)
         tipo_pago = row.get('Pago Rendimiento', '')
-        inicio = row['Fecha de inicio']
-        fin = row['Fecha de vencimiento']
-        tasa = row.get('Tasa Decimal', 0)
+        inicio = row[col_inicio]
+        fin = row[col_fin]
+        tasa = row.get('Tasa Decimal Pasivo', 0)
             
         if pd.notna(fin) and tipo_pago != 'Amortización':
             flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Devolución Capital', 'Monto': monto_inv})
@@ -114,13 +119,11 @@ def proyectar_flujos_pasivo(df):
         if tipo_pago == 'Mensual' and pd.notna(inicio) and pd.notna(fin):
             fecha_anterior = inicio
             meses_agregados = 1
-            
             while True:
                 fecha_actual = inicio + relativedelta(months=meses_agregados)
                 try:
                     dia = int(str(row.get('Día pago cupón', '0')).replace('.0', '').strip())
-                    if dia > 0:
-                        fecha_actual = fecha_actual.replace(day=min(dia, fecha_actual.days_in_month))
+                    if dia > 0: fecha_actual = fecha_actual.replace(day=min(dia, fecha_actual.days_in_month))
                 except: pass
                 
                 if fecha_actual > fin:
@@ -130,9 +133,7 @@ def proyectar_flujos_pasivo(df):
                 dias_naturales = (fecha_actual - fecha_anterior).days
                 interes = (tasa / 360.0) * dias_naturales * monto_inv
                 
-                if interes > 0:
-                    flujos.append({'Fecha': fecha_actual, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': interes})
-                
+                if interes > 0: flujos.append({'Fecha': fecha_actual, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': interes})
                 if fecha_actual == fin: break
                 fecha_anterior = fecha_actual
                 meses_agregados += 1
@@ -151,7 +152,6 @@ def proyectar_flujos_pasivo(df):
                     dia = int(str(row.get('Día pago cupón', '0')).replace('.0', '').strip())
                     if dia > 0: f_pago = f_pago.replace(day=min(dia, f_pago.days_in_month))
                 except: pass
-                    
                 if f_pago > fin:
                     if f_pago != fin and (inicio + relativedelta(months=m-1)) < fin: fechas_pago.append(fin)
                     break
@@ -163,7 +163,6 @@ def proyectar_flujos_pasivo(df):
                 capital_mensual = monto_inv / num_pagos
                 saldo_insoluto = monto_inv
                 fecha_anterior = inicio
-                
                 for f_actual in fechas_pago:
                     flujos.append({'Fecha': f_actual, 'Fondeador': fondeador, 'Concepto': 'Amortización Capital', 'Monto': capital_mensual})
                     if tasa > 0:
@@ -182,11 +181,13 @@ def proyectar_flujos_pasivo(df):
     return df_flujos
 
 def proyectar_flujos_activo(df, morosidad):
-    df['Fecha Fin'] = pd.to_datetime(df['Fecha Fin'], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=['Fecha Fin']).copy()
-    df['Mes-Año'] = df['Fecha Fin'].dt.to_period('M').astype(str)
+    col_fin = [c for c in df.columns if 'fin' in c.lower()][0] if [c for c in df.columns if 'fin' in c.lower()] else 'Fecha Fin'
+    df[col_fin] = pd.to_datetime(df[col_fin], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=[col_fin]).copy()
+    df['Mes-Año'] = df[col_fin].dt.to_period('M').astype(str)
     
-    df['Cobro Esperado'] = df['Total'] * (1 - morosidad)
+    col_total = [c for c in df.columns if 'total' in c.lower()][0] if [c for c in df.columns if 'total' in c.lower()] else 'Total'
+    df['Cobro Esperado'] = df[col_total] * (1 - morosidad)
     flujos_mensuales = df.groupby('Mes-Año')['Cobro Esperado'].sum().reset_index()
     flujos_mensuales.rename(columns={'Cobro Esperado': 'Entradas (Activo)'}, inplace=True)
     return flujos_mensuales
@@ -220,26 +221,31 @@ def formatear_cifra(val):
     if pd.isna(val) or val == 0: return ""
     abs_val = abs(val)
     signo = "-" if val < 0 else ""
-    if abs_val >= 1_000_000:
-        return f"{signo}{abs_val/1_000_000:.2f}m"
-    elif abs_val >= 1_000:
-        return f"{signo}{int(abs_val/1000)}k"
-    else:
-        return f"{signo}{int(abs_val)}"
+    if abs_val >= 1_000_000: return f"{signo}{abs_val/1_000_000:.2f}m"
+    elif abs_val >= 1_000: return f"{signo}{int(abs_val/1000)}k"
+    else: return f"{signo}{int(abs_val)}"
 
 # ==========================================
-# 5. CÁLCULO DE TASAS Y MÁRGENES
+# 5. CÁLCULO DE TASAS Y MÁRGENES (BLINDADO)
 # ==========================================
-total_activo = df_activo['Capital'].sum() if 'Capital' in df_activo.columns else 0
+col_capital_act = [c for c in df_activo.columns if 'capital' in c.lower()]
+col_cap = col_capital_act[0] if col_capital_act else 'Capital'
+
+total_activo = df_activo[col_cap].sum() if col_cap in df_activo.columns else 0
 total_pasivo = df_pasivo['Monto de Inversión'].sum() if 'Monto de Inversión' in df_pasivo.columns else 0
 flujo_proximo_mes = df_alm['Flujo Neto'].iloc[0] if not df_alm.empty else 0
 
 tasa_pond_act = 0.0
-if 'Tasa Decimal Activo' in df_activo.columns and 'Id Crédito' in df_activo.columns:
+# Blindaje 3: Búsqueda flexible de la columna Id Crédito
+col_id = [c for c in df_activo.columns if 'id cr' in c.lower() or 'id_cr' in c.lower()]
+
+if 'Tasa Decimal Activo' in df_activo.columns and col_id:
+    id_credito = col_id[0]
     # Agrupamos para calcular el Saldo Insoluto real de cada crédito
-    df_agrupado = df_activo.groupby('Id Crédito').agg(
-        Saldo_Insoluto=('Capital', 'sum'),
-        Tasa=('Tasa Decimal Activo', 'first')
+    # Usamos 'max' para la tasa, así ignoramos cualquier celda vacía (0.0) accidental
+    df_agrupado = df_activo.groupby(id_credito).agg(
+        Saldo_Insoluto=(col_cap, 'sum'),
+        Tasa=('Tasa Decimal Activo', 'max') 
     ).reset_index()
     
     peso_total = df_agrupado['Saldo_Insoluto'].sum()
@@ -248,7 +254,7 @@ if 'Tasa Decimal Activo' in df_activo.columns and 'Id Crédito' in df_activo.col
 
 tasa_pond_pas = 0.0
 if not df_pasivo.empty and total_pasivo > 0:
-    tasa_pond_pas = (df_pasivo['Monto de Inversión'] * df_pasivo['Tasa Decimal']).sum() / total_pasivo
+    tasa_pond_pas = (df_pasivo['Monto de Inversión'] * df_pasivo['Tasa Decimal Pasivo']).sum() / total_pasivo
 
 # ==========================================
 # 6. DASHBOARD Y VISUALIZACIÓN
@@ -257,15 +263,14 @@ tab1, tab2, tab3 = st.tabs(["Centro de Mando", "Detalle Activo", "Detalle Pasivo
 
 with tab1:
     st.header("Indicadores Clave (KPIs)")
-    
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Cartera Viva Proyectada", f"${total_activo:,.2f}")
     
-    if 'Tasa Decimal Activo' in df_activo.columns and 'Id Crédito' in df_activo.columns:
+    if tasa_pond_act > 0:
         col2.metric("Tasa Pond. Activo", f"{tasa_pond_act*100:.2f}%")
         col5.metric("Margen Financiero", f"{(tasa_pond_act - tasa_pond_pas)*100:.2f}%")
     else:
-        col2.metric("Tasa Pond. Activo", "Requiere Id Crédito")
+        col2.metric("Tasa Pond. Activo", "Revisando formato...")
         col5.metric("Margen Financiero", "N/A")
         
     col3.metric("Fondeo Total", f"${total_pasivo:,.2f}")
