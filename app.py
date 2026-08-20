@@ -46,12 +46,21 @@ def limpiar_numeros(df, columnas):
             ).fillna(0)
     return df
 
-def limpiar_tasa(val):
+def limpiar_tasa_pasivo(val):
     if pd.isna(val): return 0.0
     try:
         val_str = str(val).replace('%', '').strip()
         tasa = float(val_str)
         return tasa / 100.0 if tasa > 1 else tasa
+    except:
+        return 0.0
+
+def limpiar_tasa_activo(val):
+    if pd.isna(val): return 0.0
+    try:
+        val_str = str(val).replace('%', '').strip()
+        tasa = float(val_str)
+        return tasa / 100.0
     except:
         return 0.0
 
@@ -65,13 +74,12 @@ def cargar_datos_sheets():
     df_pas = limpiar_numeros(df_pas, ['Monto de Inversión'])
     
     if '% Rendimiento' in df_pas.columns:
-        df_pas['Tasa Decimal'] = df_pas['% Rendimiento'].apply(limpiar_tasa)
+        df_pas['Tasa Decimal'] = df_pas['% Rendimiento'].apply(limpiar_tasa_pasivo)
     else:
         df_pas['Tasa Decimal'] = 0.0
         
-    # Limpieza de la tasa del activo si es que ya se agregó la columna
     if 'Tasa' in df_act.columns:
-        df_act['Tasa Decimal Activo'] = df_act['Tasa'].apply(limpiar_tasa)
+        df_act['Tasa Decimal Activo'] = df_act['Tasa'].apply(limpiar_tasa_activo)
     else:
         df_act['Tasa Decimal Activo'] = 0.0
         
@@ -222,15 +230,21 @@ def formatear_cifra(val):
 # ==========================================
 # 5. CÁLCULO DE TASAS Y MÁRGENES
 # ==========================================
-# La Cartera Viva total asume que el CSV solo contiene los pagos futuros pendientes
 total_activo = df_activo['Capital'].sum() if 'Capital' in df_activo.columns else 0
 total_pasivo = df_pasivo['Monto de Inversión'].sum() if 'Monto de Inversión' in df_pasivo.columns else 0
 flujo_proximo_mes = df_alm['Flujo Neto'].iloc[0] if not df_alm.empty else 0
 
-# Tasa Ponderada del Activo (Requiere columna 'Tasa' en tu Google Sheets)
 tasa_pond_act = 0.0
-if 'Tasa Decimal Activo' in df_activo.columns and total_activo > 0:
-    tasa_pond_act = (df_activo['Capital'] * df_activo['Tasa Decimal Activo']).sum() / total_activo
+if 'Tasa Decimal Activo' in df_activo.columns and 'Id Crédito' in df_activo.columns:
+    # Agrupamos para calcular el Saldo Insoluto real de cada crédito
+    df_agrupado = df_activo.groupby('Id Crédito').agg(
+        Saldo_Insoluto=('Capital', 'sum'),
+        Tasa=('Tasa Decimal Activo', 'first')
+    ).reset_index()
+    
+    peso_total = df_agrupado['Saldo_Insoluto'].sum()
+    if peso_total > 0:
+        tasa_pond_act = (df_agrupado['Saldo_Insoluto'] * df_agrupado['Tasa']).sum() / peso_total
 
 tasa_pond_pas = 0.0
 if not df_pasivo.empty and total_pasivo > 0:
@@ -245,14 +259,14 @@ with tab1:
     st.header("Indicadores Clave (KPIs)")
     
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Cartera Viva", f"${total_activo:,.2f}")
+    col1.metric("Cartera Viva Proyectada", f"${total_activo:,.2f}")
     
-    if 'Tasa' in df_activo.columns:
+    if 'Tasa Decimal Activo' in df_activo.columns and 'Id Crédito' in df_activo.columns:
         col2.metric("Tasa Pond. Activo", f"{tasa_pond_act*100:.2f}%")
         col5.metric("Margen Financiero", f"{(tasa_pond_act - tasa_pond_pas)*100:.2f}%")
     else:
-        col2.metric("Tasa Pond. Activo", "Sin Columna 'Tasa'")
-        col5.metric("Margen Financiero", "Requiere Tasa Activa")
+        col2.metric("Tasa Pond. Activo", "Requiere Id Crédito")
+        col5.metric("Margen Financiero", "N/A")
         
     col3.metric("Fondeo Total", f"${total_pasivo:,.2f}")
     col4.metric("Tasa Pond. Pasivo", f"{tasa_pond_pas*100:.2f}%")
