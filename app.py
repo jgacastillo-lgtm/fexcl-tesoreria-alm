@@ -13,7 +13,7 @@ st.set_page_config(page_title="FEXCL Tesorería", layout="wide")
 # Logo corporativo cargado directamente desde el repositorio
 st.image("LOGO_FEX.png", width=300) 
 
-st.title("FEX CAPITAL Loans - Módulo de Tesorería y ALM")
+st.title("Módulo de Tesorería y ALM")
 st.markdown("Centro de Control de Liquidez: Proyección de Activos vs Fondeadores")
 
 # ==========================================
