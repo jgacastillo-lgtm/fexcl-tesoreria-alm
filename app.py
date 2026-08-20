@@ -10,8 +10,8 @@ from dateutil.relativedelta import relativedelta
 # ==========================================
 st.set_page_config(page_title="FEXCL Tesorería", layout="wide")
 
-# Logo corporativo (Reemplaza la URL o el nombre del archivo local)
-# st.image("LOGO_FEX.png", width=250) 
+# Logo corporativo cargado directamente desde el repositorio
+st.image("LOGO_FEX.png", width=300) 
 
 st.title("FEX CAPITAL Loans - Módulo de Tesorería y ALM")
 st.markdown("Centro de Control de Liquidez: Proyección de Activos vs Fondeadores")
@@ -36,7 +36,7 @@ for mes in meses_proyectados:
 # ==========================================
 # 3. CONEXIÓN A GOOGLE SHEETS Y LIMPIEZA
 # ==========================================
-URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing" # <-- Pega tu URL de Google Sheets aquí
+URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing" # <-- Recuerda pegar tu URL real de Google Sheets aquí
 
 def limpiar_numeros(df, columnas):
     for col in columnas:
