@@ -6,16 +6,20 @@ from streamlit_gsheets import GSheetsConnection
 from dateutil.relativedelta import relativedelta
 
 # ==========================================
-# 1. CONFIGURACIÓN DE LA PÁGINA
+# 1. CONFIGURACIÓN DE LA PÁGINA E IDENTIDAD
 # ==========================================
-st.set_page_config(page_title="FEXCL Tesorería", page_icon="📈", layout="wide")
-st.title("📊 FEX CAPITAL Loans - Módulo de Tesorería y ALM")
+st.set_page_config(page_title="FEXCL Tesorería", layout="wide")
+
+# Logo corporativo (Reemplaza la URL o el nombre del archivo local)
+# st.image("LOGO_FEX.png", width=250) 
+
+st.title("FEX CAPITAL Loans - Módulo de Tesorería y ALM")
 st.markdown("Centro de Control de Liquidez: Proyección de Activos vs Fondeadores")
 
 # ==========================================
 # 2. BARRA LATERAL (CONTROLES Y RIESGO)
 # ==========================================
-st.sidebar.header("⚙️ Supuestos del Modelo")
+st.sidebar.header("Supuestos del Modelo")
 
 tasa_morosidad = st.sidebar.slider(
     "Tasa de Morosidad (Impago en Activo)", 
@@ -44,12 +48,10 @@ def limpiar_numeros(df, columnas):
     return df
 
 def limpiar_tasa(val):
-    """Convierte la columna de % Rendimiento (ej. '17.00%') en decimal (0.17)"""
     if pd.isna(val): return 0.0
     try:
         val_str = str(val).replace('%', '').strip()
         tasa = float(val_str)
-        # Si la tasa viene como 17 o 18 en lugar de 0.17, la dividimos
         return tasa / 100.0 if tasa > 1 else tasa
     except:
         return 0.0
@@ -60,11 +62,9 @@ def cargar_datos_sheets():
     df_act = conn.read(spreadsheet=URL_SHEET, worksheet="Activo")
     df_pas = conn.read(spreadsheet=URL_SHEET, worksheet="Pasivo")
     
-    # Limpieza de montos
     df_act = limpiar_numeros(df_act, ['Capital', 'Interés', 'Total'])
     df_pas = limpiar_numeros(df_pas, ['Monto de Inversión'])
     
-    # Limpieza de la tasa de rendimiento (Columna D)
     if '% Rendimiento' in df_pas.columns:
         df_pas['Tasa Decimal'] = df_pas['% Rendimiento'].apply(limpiar_tasa)
     else:
@@ -84,7 +84,6 @@ except Exception as e:
 def proyectar_flujos_pasivo(df):
     flujos = []
     
-    # IMPORTANTE: dayfirst=True fuerza a Python a leer formato México (DD/MM/YYYY)
     df['Fecha de inicio'] = pd.to_datetime(df['Fecha de inicio'], dayfirst=True, errors='coerce')
     df['Fecha de vencimiento'] = pd.to_datetime(df['Fecha de vencimiento'], dayfirst=True, errors='coerce')
     
@@ -96,11 +95,9 @@ def proyectar_flujos_pasivo(df):
         fin = row['Fecha de vencimiento']
         tasa = row.get('Tasa Decimal', 0)
             
-        # Regla 1: Devolución de Capital al final
         if pd.notna(fin) and tipo_pago != 'Amortización':
             flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Devolución Capital', 'Monto': monto_inv})
         
-        # Regla 2: Esquema MENSUAL (Cálculo exacto: (Tasa/360) * Días * Monto)
         if tipo_pago == 'Mensual' and pd.notna(inicio) and pd.notna(fin):
             fecha_anterior = inicio
             meses_agregados = 1
@@ -108,7 +105,6 @@ def proyectar_flujos_pasivo(df):
             while True:
                 fecha_actual = inicio + relativedelta(months=meses_agregados)
                 
-                # Ajustamos al día de pago si existe en la columna
                 try:
                     dia = int(str(row.get('Día pago cupón', '0')).replace('.0', '').strip())
                     if dia > 0:
@@ -116,14 +112,12 @@ def proyectar_flujos_pasivo(df):
                 except:
                     pass
                 
-                # Si la fecha calculada supera el vencimiento, garantizamos que el último pago se haga en la fecha de fin
                 if fecha_actual > fin:
                     if fecha_anterior < fin:
                         fecha_actual = fin
                     else:
                         break
                 
-                # Fórmula Financiera FEX CAPITAL: (Tasa / 360) * Días Naturales * Monto
                 dias_naturales = (fecha_actual - fecha_anterior).days
                 interes = (tasa / 360.0) * dias_naturales * monto_inv
                 
@@ -136,13 +130,11 @@ def proyectar_flujos_pasivo(df):
                 fecha_anterior = fecha_actual
                 meses_agregados += 1
                 
-        # Regla 3: Esquema AL TÉRMINO
         elif tipo_pago == 'Al termino' and pd.notna(inicio) and pd.notna(fin):
             dias_totales = (fin - inicio).days
             interes_total = (tasa / 360.0) * dias_totales * monto_inv
             flujos.append({'Fecha': fin, 'Fondeador': fondeador, 'Concepto': 'Interés', 'Monto': interes_total})
             
-        # Regla 4: Esquema AMORTIZACIÓN (Partes iguales)
         elif tipo_pago == 'Amortización' and pd.notna(inicio) and pd.notna(fin):
             fechas_pago = []
             m = 1
@@ -186,7 +178,6 @@ def proyectar_flujos_pasivo(df):
 
 # --- Motor del Activo ---
 def proyectar_flujos_activo(df, morosidad):
-    # Formato México para el activo también
     df['Fecha Fin'] = pd.to_datetime(df['Fecha Fin'], dayfirst=True, errors='coerce')
     df = df.dropna(subset=['Fecha Fin']).copy()
     df['Mes-Año'] = df['Fecha Fin'].dt.to_period('M').astype(str)
@@ -219,10 +210,25 @@ for mes, retiro in salidas_reales.items():
 df_alm = df_alm.sort_values('Mes-Año')
 df_alm['Flujo Neto'] = df_alm['Entradas (Activo)'] - df_alm['Salidas (Pasivo)']
 
+# --- Formato Visual para Gráfica (k y m) ---
+def formatear_cifra(val):
+    if pd.isna(val): return "0k"
+    abs_val = abs(val)
+    signo = "-" if val < 0 else ""
+    if abs_val >= 1_000_000:
+        return f"{signo}{abs_val/1_000_000:.2f}m"
+    elif abs_val >= 1_000:
+        return f"{signo}{int(abs_val/1000)}k"
+    else:
+        return f"{signo}{int(abs_val)}"
+
+if not df_alm.empty:
+    df_alm['Etiqueta Visual'] = df_alm['Flujo Neto'].apply(formatear_cifra)
+
 # ==========================================
 # 5. DASHBOARD Y VISUALIZACIÓN
 # ==========================================
-tab1, tab2, tab3 = st.tabs(["📊 Centro de Mando", "📥 Detalle Activo", "📤 Detalle Pasivo"])
+tab1, tab2, tab3 = st.tabs(["Centro de Mando", "Detalle Activo", "Detalle Pasivo"])
 
 with tab1:
     st.header("Indicadores Clave (KPIs)")
@@ -250,7 +256,18 @@ with tab1:
         fig = go.Figure()
         fig.add_trace(go.Bar(x=df_grafica['Mes-Año'], y=df_grafica['Entradas (Activo)'], name='Entradas (Cobranza)', marker_color='#2ca02c'))
         fig.add_trace(go.Bar(x=df_grafica['Mes-Año'], y=-df_grafica['Salidas (Pasivo)'], name='Salidas (Fondeadores)', marker_color='#d62728'))
-        fig.add_trace(go.Scatter(x=df_grafica['Mes-Año'], y=df_grafica['Flujo Neto'], name='Flujo Neto del Mes', mode='lines+markers', line=dict(color='black', width=3)))
+        
+        # Línea de flujo neto con las etiquetas de K o M
+        fig.add_trace(go.Scatter(
+            x=df_grafica['Mes-Año'], 
+            y=df_grafica['Flujo Neto'], 
+            name='Flujo Neto del Mes', 
+            mode='lines+markers+text', 
+            text=df_grafica['Etiqueta Visual'],
+            textposition='top center',
+            textfont=dict(size=12, color='black'),
+            line=dict(color='black', width=3)
+        ))
         
         fig.update_layout(barmode='relative', title="Entradas vs Salidas Proyectadas", xaxis_title="Mes", yaxis_title="Monto ($)")
         st.plotly_chart(fig, use_container_width=True)
@@ -262,7 +279,6 @@ with tab2:
 with tab3:
     st.subheader("Base de Datos - Salidas (Pasivo con Cálculo Exacto)")
     if not df_flujos_pasivo.empty:
-        # Formateamos los montos para que se vean como moneda en la tabla
         df_flujos_pasivo_display = df_flujos_pasivo.sort_values('Fecha').copy()
         df_flujos_pasivo_display['Fecha'] = df_flujos_pasivo_display['Fecha'].dt.strftime('%d/%m/%Y')
         df_flujos_pasivo_display['Monto'] = df_flujos_pasivo_display['Monto'].apply(lambda x: f"${x:,.2f}")
