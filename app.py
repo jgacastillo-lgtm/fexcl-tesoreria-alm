@@ -4,6 +4,7 @@ import datetime
 import plotly.graph_objects as go
 from streamlit_gsheets import GSheetsConnection
 from dateutil.relativedelta import relativedelta
+import streamlit.components.v1 as components
 
 # ==========================================
 # 1. CONFIGURACIÓN DE LA PÁGINA E IDENTIDAD
@@ -38,7 +39,6 @@ for mes in meses_proyectados:
 URL_SHEET = "https://docs.google.com/spreadsheets/d/1MYRlXR03vz5T8bw-g-14Tr6LkGERFXIxTUeL_CwxydE/edit?usp=sharing" # <-- RECUERDA PONER TU URL REAL AQUÍ
 
 def limpiar_numeros(df, columnas):
-    # Buscamos las columnas de forma flexible (ignorando espacios)
     cols_reales = df.columns.tolist()
     for col_buscada in columnas:
         for col_real in cols_reales:
@@ -54,7 +54,6 @@ def limpiar_tasa(val):
     try:
         val_str = str(val).replace('%', '').strip()
         tasa = float(val_str)
-        # Si la tasa es mayor o igual a 1 (ej. 38), la dividimos para hacerla decimal (0.38)
         return tasa / 100.0 if tasa >= 1 else tasa
     except:
         return 0.0
@@ -65,21 +64,18 @@ def cargar_datos_sheets():
     df_act = conn.read(spreadsheet=URL_SHEET, worksheet="Activo")
     df_pas = conn.read(spreadsheet=URL_SHEET, worksheet="Pasivo")
     
-    # Blindaje 1: Quitamos espacios invisibles de TODOS los encabezados
     df_act.columns = df_act.columns.str.strip()
     df_pas.columns = df_pas.columns.str.strip()
     
     df_act = limpiar_numeros(df_act, ['Capital', 'Interés', 'Total'])
     df_pas = limpiar_numeros(df_pas, ['Monto de Inversión'])
     
-    # Limpieza Tasa Pasivo
     col_rendimiento = [c for c in df_pas.columns if 'rendimiento' in c.lower()]
     if col_rendimiento:
         df_pas['Tasa Decimal Pasivo'] = df_pas[col_rendimiento[0]].apply(limpiar_tasa)
     else:
         df_pas['Tasa Decimal Pasivo'] = 0.0
         
-    # Blindaje 2: Búsqueda flexible de la columna "Tasa" en el Activo
     col_tasa_act = [c for c in df_act.columns if c.lower() == 'tasa']
     if col_tasa_act:
         df_act['Tasa Decimal Activo'] = df_act[col_tasa_act[0]].apply(limpiar_tasa)
@@ -95,7 +91,7 @@ except Exception as e:
     st.stop()
 
 # ==========================================
-# 4. MOTORES DE PROYECCIÓN (ALM) EXACTOS
+# 4. MOTORES DE PROYECCIÓN (ALM)
 # ==========================================
 def proyectar_flujos_pasivo(df):
     flujos = []
@@ -226,23 +222,19 @@ def formatear_cifra(val):
     else: return f"{signo}{int(abs_val)}"
 
 # ==========================================
-# 5. CÁLCULO DE TASAS Y MÁRGENES (BLINDADO)
+# 5. CÁLCULO DE TASAS Y MÁRGENES
 # ==========================================
 col_capital_act = [c for c in df_activo.columns if 'capital' in c.lower()]
 col_cap = col_capital_act[0] if col_capital_act else 'Capital'
 
 total_activo = df_activo[col_cap].sum() if col_cap in df_activo.columns else 0
 total_pasivo = df_pasivo['Monto de Inversión'].sum() if 'Monto de Inversión' in df_pasivo.columns else 0
-flujo_proximo_mes = df_alm['Flujo Neto'].iloc[0] if not df_alm.empty else 0
 
 tasa_pond_act = 0.0
-# Blindaje 3: Búsqueda flexible de la columna Id Crédito
 col_id = [c for c in df_activo.columns if 'id cr' in c.lower() or 'id_cr' in c.lower()]
 
 if 'Tasa Decimal Activo' in df_activo.columns and col_id:
     id_credito = col_id[0]
-    # Agrupamos para calcular el Saldo Insoluto real de cada crédito
-    # Usamos 'max' para la tasa, así ignoramos cualquier celda vacía (0.0) accidental
     df_agrupado = df_activo.groupby(id_credito).agg(
         Saldo_Insoluto=(col_cap, 'sum'),
         Tasa=('Tasa Decimal Activo', 'max') 
@@ -322,6 +314,50 @@ with tab1:
         
         fig.update_layout(barmode='relative', title="Desglose de Entradas vs Salidas", xaxis_title="Mes", yaxis_title="Monto ($)", height=600)
         st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+        
+        # Inyección de CSS para formato de impresión limpio y botón de PDF
+        st.markdown("""
+            <style>
+            @media print {
+                section[data-testid="stSidebar"] {display: none !important;}
+                header[data-testid="stHeader"] {display: none !important;}
+                footer {display: none !important;}
+                .stDeployButton {display: none !important;}
+                .stApp {background-color: white !important;}
+                .block-container {max-width: 100% !important; padding: 0 !important;}
+            }
+            </style>
+        """, unsafe_allow_html=True)
+        
+        components.html("""
+            <script>
+            function printReport() {
+                window.parent.print();
+            }
+            </script>
+            <div style="text-align: right;">
+                <button onclick="printReport()" style="
+                    background-color: #2ca02c; 
+                    border: none;
+                    color: white;
+                    padding: 12px 24px;
+                    text-align: center;
+                    text-decoration: none;
+                    display: inline-block;
+                    font-size: 16px;
+                    font-weight: bold;
+                    margin: 4px 2px;
+                    cursor: pointer;
+                    border-radius: 8px;
+                    font-family: sans-serif;
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                ">
+                    Descargar Reporte PDF
+                </button>
+            </div>
+        """, height=70)
 
 with tab2:
     st.subheader("Base de Datos - Entradas (Activo)")
